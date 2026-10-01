@@ -4,7 +4,7 @@
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>DiceVaders.ConstellationTool</AssemblyName>
     <RootNamespace>DiceVaders.ConstellationTool</RootNamespace>
-    <Version>2.9.0</Version>
+    <Version>3.1.0</Version>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
