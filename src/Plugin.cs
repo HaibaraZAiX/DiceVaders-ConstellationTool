@@ -24,12 +24,21 @@ namespace DiceVaders.ConstellationTool
     ///   · 游戏按钮是多层叠加（BG/Top/Bot/Title 四子对象），单独取一层是纯白 —— 必须克隆整个容器
     ///     （实测容器名 RevealObject），且要【保持原版长宽比】，压缩高度会把上下边框挤出可见区。
     ///   · ConstellationController 在局内也存在，判断"星座界面是否打开"必须用 IsShowing 静态标志。
-    ///   · 详情卡片由 OnPressReveal() 装配，不是 Initialize()；且只对 !isLocked 的槽位调用。
+    ///   · 详情卡片由 Initialize() 内部的 SetConstellationToArtifact() 装配（v3.0 用伪代码实证，
+    ///     修正了早期"由 OnPressReveal 装配"的错误判断）。
+    ///
+    /// ★ v3.0 新增单项重掷 —— 以下结论全部来自 Ghidra 伪代码，修正了 v2.9 的错误判断：
+    ///   · UpdateConstellationView() 【确实】按 EncounterModel.Constellations(0x50) 逐槽位重建 UI
+    ///     （v2.9 曾误判为"无重排能力"，那是只看反汇编得出的错误结论）。
+    ///   · Constellation.Initialize() 内部就会调 SetConstellationToArtifact()，详情卡片自动跟随。
+    ///   · 连线图 ShapeVisualizer 不在任何自动流程里，必须手动 SetConstellation+Build+Play。
+    ///   · ArtifactName 是静态类型枚举，ArtifactID 是运行时实例编号：
+    ///     新实例要经 ArtifactFactory.CreateArtifactModel(name) 创建 → EncounterModel.AddModelItem() 注册。
     ///
     /// v2.8 全量审查后整理：合并 Update 里重复的初始化块、缓存查找结果、文字校正改为缓存组件引用、
-    ///      规范化不再硬编码兜底值、清掉历次改向留下的死代码、把单刷的数据落地挪到装配之前。
+    ///      规范化不再硬编码兜底值、清掉历次改向留下的死代码。
     /// </summary>
-    [BepInPlugin(Guid, "DiceVaders Constellation Tool", "2.9.0")]
+    [BepInPlugin(Guid, "DiceVaders Constellation Tool", "3.1.0")]
     public class Plugin : BasePlugin
     {
         public const string Guid = "dicevaders.constellationtool";
@@ -46,11 +55,12 @@ namespace DiceVaders.ConstellationTool
         internal static ConfigEntry<float> LeftOffset;
         internal static ConfigEntry<float> BottomOffset;
         internal static ConfigEntry<float> BtnWidth;
-        internal static ConfigEntry<float> BtnHeight;
         internal static ConfigEntry<float> ForceFontSize;
         internal static ConfigEntry<bool> LogCandidates;
         internal static ConfigEntry<int> MaxRerollPerSession;
         internal static ConfigEntry<bool> AnchorBottom;
+        internal static ConfigEntry<bool> EnableSingleReroll;
+        internal static ConfigEntry<float> SingleBtnWidth;
 
         public override void Load()
         {
@@ -74,13 +84,19 @@ namespace DiceVaders.ConstellationTool
                 new ConfigDescription("左下角锚点时：距屏幕底部像素（「星座系统」上方）。", new AcceptableValueRange<float>(0f, 1200f)));
 
             BtnWidth = Config.Bind("1-按钮", "Width", 350f,
-                new ConfigDescription("按钮宽度。", new AcceptableValueRange<float>(100f, 700f)));
-            BtnHeight = Config.Bind("1-按钮", "Height", 76f,
-                new ConfigDescription("按钮高度。", new AcceptableValueRange<float>(30f, 200f)));
+                new ConfigDescription("主按钮宽度（高度自动按游戏原版长宽比跟随，不单独设置 —— " +
+                    "原版按钮的上下边框是独立子对象、按原高度定位，压缩高度会把边框挤出可见区）。",
+                    new AcceptableValueRange<float>(100f, 700f)));
             ForceFontSize = Config.Bind("1-按钮", "FontSize", 42f,
                 new ConfigDescription("自建按钮的字号，0=沿用取到的原字号。", new AcceptableValueRange<float>(0f, 120f)));
             SourceButtonName = Config.Bind("1-按钮", "SourceButtonName", "",
                 "指定克隆哪个按钮（名字含该串即可）。留空=自动挑。日志会列出全部候选。");
+
+            EnableSingleReroll = Config.Bind("1-按钮", "EnableSingleReroll", true,
+                "显示 3 个单项刷新按钮，各自贴在对应星座卡片下方。关掉则只有「刷新全部」。");
+            SingleBtnWidth = Config.Bind("1-按钮", "SingleButtonWidth", 170f,
+                new ConfigDescription("单项刷新按钮的宽度（高度同样按比例跟随）。",
+                    new AcceptableValueRange<float>(50f, 400f)));
 
             LogCandidates = Config.Bind("2-调试", "LogCandidates", true,
                 "每次进星座界面时打印场景里的按钮候选清单（便于排查）。");
@@ -98,7 +114,7 @@ namespace DiceVaders.ConstellationTool
                 new ConfigDescription("重掷后等待多久再补详情（秒）。",
                     new AcceptableValueRange<float>(0f, 5f)));
 
-            Logger.LogInfo("===== Constellation Tool v2.9.0 (移除单项重掷：反汇编证实游戏无按槽位重排接口) =====");
+            Logger.LogInfo("===== Constellation Tool v3.1.0 (刷新全部 + 每张卡片独立刷新) =====");
 
             ClassInjector.RegisterTypeInIl2Cpp<ConstellationUI>();
             var go = new GameObject("DiceVaders_ConstellationTool");
@@ -117,6 +133,8 @@ namespace DiceVaders.ConstellationTool
         private bool _wasInScene;
         private bool _wasShowing;
         private GameObject _nativeButton;
+        /// <summary>单项重掷小按钮（下标 = 星座槽位序号）。</summary>
+        private readonly System.Collections.Generic.List<GameObject> _singleButtons = new System.Collections.Generic.List<GameObject>();
         private static GameObject _overlayCanvas;
         private float _restoreAt = -1f;
         private float _verifyAt = -1f;
@@ -243,6 +261,16 @@ namespace DiceVaders.ConstellationTool
                 }
                 catch { }
             }
+            // 小按钮跟随主按钮显隐
+            for (int i = 0; i < _singleButtons.Count; i++)
+            {
+                var b = _singleButtons[i];
+                if (b == null) continue;
+                try { if (b.activeSelf != showing) b.SetActive(showing); } catch { }
+            }
+
+            // 小按钮贴到各自卡片旁边（卡片自由布局，索引顺序 ≠ 视觉顺序）
+            if (showing) UpdateSingleButtonPositions(cc);
 
             // 游戏会把克隆按钮的文字重写回「揭晓！」，每帧盯住
             if (showing) EnforceButtonTexts();
@@ -460,7 +488,7 @@ namespace DiceVaders.ConstellationTool
             var rt = go.AddComponent<RectTransform>();
             go.layer = 5;   // UI
 
-            rt.sizeDelta = new Vector2(Plugin.BtnWidth.Value * widthScale, Plugin.BtnHeight.Value * widthScale);
+            rt.sizeDelta = new Vector2(Plugin.BtnWidth.Value * widthScale, 60f * widthScale);
             ApplyAnchorForOffset(rt, 0f);
             rt.localScale = Vector3.one;
             rt.localRotation = Quaternion.identity;
@@ -683,7 +711,7 @@ namespace DiceVaders.ConstellationTool
                         _nativeButton.transform.SetAsLastSibling();
 
                         StripGameComponents(_nativeButton);   // 只删 StarVaders 逻辑组件，子对象的美术保留
-                        RetextButton(_nativeButton, "重掷全部");
+                        RetextButton(_nativeButton, "刷新全部");
 
                         var nrt = _nativeButton.GetComponent<RectTransform>();
                         if (nrt != null)
@@ -711,7 +739,7 @@ namespace DiceVaders.ConstellationTool
 
                 if (_nativeButton == null)
                 {
-                    _nativeButton = CreateOwnButton(font, fontSize, "重掷全部");
+                    _nativeButton = CreateOwnButton(font, fontSize, "刷新全部");
                     if (_nativeButton != null)
                     {
                         _nativeButton.transform.SetParent(host.transform, false);
@@ -721,11 +749,79 @@ namespace DiceVaders.ConstellationTool
                     else Log("  !! 自建按钮也失败");
                 }
 
+                // ★ 每张卡片下方的「刷新」按钮，复用同一个克隆源缩小尺寸
+                if (Plugin.EnableSingleReroll.Value) BuildSingleButtons(revealSrc, host, _nativeButton);
+
                 _verifyAt = Time.realtimeSinceStartup + 0.5f;
             }
             catch (Exception e)
             {
                 Log($"创建按钮失败: {e.GetType().Name}: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 创建 3 个单项刷新按钮（文字统一为「刷新」），各自贴在对应星座卡片下方。
+        /// 复用主按钮的克隆源，只改尺寸与文字，保证外观与原版一致。
+        /// 竖排在主按钮【外侧】—— 右下角时往上叠、右上角时往下叠（由 ApplyAnchorForOffset 的 extra 决定方向）。
+        /// </summary>
+        private void BuildSingleButtons(GameObject src, GameObject host, GameObject mainBtn)
+        {
+            // 先清旧的：星座界面每次重新打开都会走到这里
+            for (int i = 0; i < _singleButtons.Count; i++)
+            {
+                try { if (_singleButtons[i] != null) UnityEngine.Object.Destroy(_singleButtons[i]); } catch { }
+            }
+            _singleButtons.Clear();
+
+            if (src == null || host == null) { Log("  小按钮：无克隆源，跳过"); return; }
+
+            // 源尺寸（用于保持原版长宽比）
+            float baseW = 342.8f, baseH = 123.3f;
+            try
+            {
+                var srt = src.GetComponent<RectTransform>();
+                if (srt != null && srt.sizeDelta.x > 1f && srt.sizeDelta.y > 1f)
+                { baseW = srt.sizeDelta.x; baseH = srt.sizeDelta.y; }
+            }
+            catch { }
+
+            float kOne = Plugin.SingleBtnWidth.Value / baseW;
+            float oneH = baseH * kOne;
+            float kMain = Plugin.BtnWidth.Value / baseW;
+            float mainH = baseH * kMain;
+
+            for (int i = 0; i < 3; i++)
+            {
+                try
+                {
+                    var b = UnityEngine.Object.Instantiate(src, host.transform);
+                    b.name = $"DiceVaders_RerollButton_One{i + 1}";
+                    b.layer = 5;
+                    b.SetActive(true);
+                    b.transform.SetAsLastSibling();
+
+                    StripGameComponents(b);
+                    RetextButton(b, "刷新");
+
+                    var nrt = b.GetComponent<RectTransform>();
+                    if (nrt != null)
+                    {
+                        nrt.sizeDelta = new Vector2(baseW * kOne, oneH);
+                        nrt.localScale = Vector3.one;
+                        nrt.localRotation = Quaternion.identity;
+                        // 初始位置先放屏幕外，随后由 UpdateSingleButtonPositions()
+                        // 每帧贴到对应卡片旁边 —— 卡片是自由布局，索引顺序 ≠ 视觉顺序，
+                        // 用固定偏移排数字按钮会对不上号（v3.0 首测实测）。
+                        nrt.anchorMin = nrt.anchorMax = new Vector2(0f, 0f);
+                        nrt.pivot = new Vector2(0.5f, 0.5f);
+                        nrt.anchoredPosition = new Vector2(-9999f, -9999f);
+                    }
+
+                    _singleButtons.Add(b);
+                    Log($"  小按钮 {i + 1} 已创建 ({baseW * kOne:0}x{oneH:0})");
+                }
+                catch (Exception e) { Log($"  小按钮 {i + 1} 创建失败: {e.Message}"); }
             }
         }
 
@@ -873,11 +969,23 @@ namespace DiceVaders.ConstellationTool
             try { showing = ConstellationController.IsShowing; } catch { }
             if (!showing) return;
 
-            // 主按钮：重掷全部
+            // 主按钮：刷新全部
             if (HitTest(_nativeButton))
             {
-                Log("「重掷全部」被点击");
+                Log("「刷新全部」被点击");
                 DoReroll();
+                return;
+            }
+
+            // 各卡片下方的「刷新」按钮
+            for (int i = 0; i < _singleButtons.Count; i++)
+            {
+                if (HitTest(_singleButtons[i]))
+                {
+                    Log($"「刷新第 {i + 1} 个」被点击");
+                    DoRerollSingle(i);
+                    return;
+                }
             }
         }
 
@@ -957,6 +1065,249 @@ namespace DiceVaders.ConstellationTool
                 SetStatus("已重掷，正在补详情…");
             }
             catch (Exception e) { SetStatus("重掷失败: " + e.GetType().Name + ": " + e.Message); }
+        }
+
+        // ---------- 单项重掷 ----------
+
+        /// <summary>
+        /// 单项重掷：只替换目标槽位的星座。
+        ///
+        /// ★ 与「重掷全部」的本质区别：本方法【不调 CreateConstellations()】，因此不走任务引擎、
+        ///   不会往 EncounterModel.Constellations 追加数据 —— 数据长度不变，没有堆积风险。
+        ///
+        /// 依据（Ghidra 伪代码实证，详见 _analysis\星座单项重掷_实现方案.md）：
+        ///   · UpdateConstellationView() 会按 EncounterModel.Constellations(0x50) 逐槽位重建 UI
+        ///   · Constellation.Initialize() 内部就调 SetConstellationToArtifact() → 详情卡片自动跟随
+        ///   · 连线图 ShapeVisualizer 不在任何自动流程里，必须手动补（沿用 RestoreDetails）
+        ///   · ArtifactName 是静态类型枚举，ArtifactID 是运行时实例编号 ——
+        ///     新实例必须经 ArtifactFactory.CreateArtifactModel() 创建 + EncounterModel.AddModelItem() 注册
+        /// </summary>
+        private void DoRerollSingle(int index)
+        {
+            var cc = FindController();
+            var ec = FindEncounter();
+            if (cc == null || ec == null) { SetStatus("不在星座场景"); return; }
+
+            // ---- 与全部重掷一致的安全守卫 ----
+            bool showing = false, transitioning = false;
+            try { showing = ConstellationController.IsShowing; } catch { }
+            try { transitioning = cc.IsTransitioning; } catch { }
+            if (!showing) { SetStatus("已拦截：当前不在星座界面"); return; }
+            if (transitioning) { SetStatus("已拦截：界面过渡中"); return; }
+            if (Time.realtimeSinceStartup - _lastRerollAt < 0.45f) return;
+
+            var em = ec.EncounterModel;
+            if (em == null) { SetStatus("取不到 EncounterModel"); return; }
+
+            var cl = em.Constellations;
+            if (cl == null || index < 0 || index >= cl.Count)
+            {
+                SetStatus($"槽位 {index + 1} 无数据（列表 {(cl == null ? -1 : cl.Count)} 项）");
+                return;
+            }
+
+            // 已锁定的槽位不动 —— 对 locked 做操作会把卡片揭到错误位置（v1.1 教训）
+            bool locked = false;
+            try
+            {
+                var ui = cc.Constellations;
+                if (ui != null && index < ui.Count && ui[index] != null) locked = ui[index].isLocked;
+            }
+            catch { }
+            if (locked) { SetStatus($"槽位 {index + 1} 已锁定，跳过"); return; }
+
+            try
+            {
+                // 1) 算候选池（复刻游戏自己的三重过滤）
+                var pool = BuildCandidatePool(em, cl);
+                if (pool.Count == 0) { SetStatus("没有可替换的星座（候选池为空）"); return; }
+
+                // 2) 随机挑一个
+                var pick = pool[UnityEngine.Random.Range(0, pool.Count)];
+
+                // 3) 建实例并注册 —— ArtifactID 是运行时编号，不能凭空造
+                var factory = em.ArtifactFactory;
+                if (factory == null) { SetStatus("取不到 ArtifactFactory"); return; }
+
+                var newModel = factory.CreateArtifactModel(pick.ArtifactName);
+                if (newModel == null) { SetStatus("创建星座实例失败"); return; }
+
+                var newId = newModel.ArtifactID;
+
+                // 注册进 EncounterModel.ModelItemDict —— 不注册的话 UpdateConstellationView
+                // 用 ArtifactID 反查模型时会查不到。
+                // ★ interop 的坑：ID 被生成为 class（Il2CppObjectBase 子类），而 ArtifactID 是
+                //   struct 且未实现它，直接传参编译不过 —— 必须用 il2cpp_value_box 手动装箱。
+                if (!TryAddModelItem(em, newId, newModel))
+                {
+                    SetStatus("注册星座实例失败（详见日志）");
+                    return;
+                }
+
+                // 4) 只改数据：替换目标位
+                int oldId = -1;
+                try { oldId = cl[index].Number; } catch { }
+                cl[index] = newId;
+
+                _lastRerollAt = Time.realtimeSinceStartup;
+
+                // 5) 让游戏自己重建 UI（详情卡片会随之自动装配）
+                TryUpdateView(cc);
+
+                // 6) 连线图不在自动流程里，排一次手动补
+                _restoreAt = Time.realtimeSinceStartup + Plugin.RestoreDelay.Value;
+
+                SetStatus($"槽位 {index + 1} → {pick.ArtifactName}");
+                Log($"[单项重掷] 槽位{index + 1}: 旧ID={oldId} → 新ID={newId.Number} 名字={pick.ArtifactName} 候选池={pool.Count}");
+            }
+            catch (Exception e)
+            {
+                SetStatus("单项重掷失败: " + e.GetType().Name + ": " + e.Message);
+                Log($"[单项重掷] 异常: {e}");
+            }
+        }
+
+        /// <summary>
+        /// 把新建的模型注册进 EncounterModel.ModelItemDict。
+        ///
+        /// ★ 为什么要装箱：interop 把接口 ID 生成为 class（Il2CppObjectBase 子类，构造要 IntPtr），
+        ///   而 ArtifactID 是 4 字节 struct 且并未实现它 —— 直接传参编译不过。
+        ///   游戏内部同样是装箱后传的（CreateArtifactTask 里走 il2cpp_value_box）。
+        /// </summary>
+        private bool TryAddModelItem(EncounterModel em, ArtifactID id, ArtifactModel model)
+        {
+            try
+            {
+                unsafe
+                {
+                    ArtifactID local = id;
+                    IntPtr boxed = IL2CPP.il2cpp_value_box(
+                        Il2CppClassPointerStore<ArtifactID>.NativeClassPtr,
+                        (IntPtr)(&local));
+                    if (boxed == IntPtr.Zero) { Log("  装箱 ArtifactID 返回 0，注册放弃"); return false; }
+
+                    var boxedId = new ID(boxed);
+                    em.AddModelItem(boxedId, model);
+                }
+                return true;
+            }
+            catch (Exception e)
+            {
+                Log($"  TryAddModelItem 失败: {e.GetType().Name}: {e.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 构建可选星座池 —— 复刻游戏 CreateConstellations 里那三个过滤谓词：
+        ///   b__0: ContentGetter.IsArtifactGettableInCurrentRun(a.ArtifactName, encounterModel)
+        ///   b__1: 再排除「已在本局星座列表里」的（以及 UniqueArtifacts(0x78) 互斥的）
+        /// 实现上保守：只做前两条（可获得 + 不重复）。宁可候选少，也不给错的。
+        /// </summary>
+        private System.Collections.Generic.List<ArtifactModel> BuildCandidatePool(
+            EncounterModel em, StarVaders.CloneableList<ArtifactID> current)
+        {
+            var result = new System.Collections.Generic.List<ArtifactModel>();
+            try
+            {
+                var all = ContentGetter.GetAllArtifactsOfType(ArtifactType.Constellation);
+                if (all == null) { Log("  候选池: GetAllArtifactsOfType(Constellation) 返回 null"); return result; }
+
+                // 收集「本局已有」的 ArtifactName。
+                // ★ 从 UI 槽位的 ArtifactModel 取名字，避开 GetModelItem<ID> 的装箱麻烦。
+                var taken = new System.Collections.Generic.HashSet<int>();
+                try
+                {
+                    var cc0 = FindController();
+                    if (cc0 != null)
+                    {
+                        var ui = cc0.Constellations;
+                        if (ui != null)
+                        {
+                            for (int j = 0; j < ui.Count; j++)
+                            {
+                                var c = ui[j];
+                                if (c == null) continue;
+                                try
+                                {
+                                    var am0 = c.ArtifactModel;
+                                    if (am0 != null) taken.Add((int)am0.ArtifactName);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+                catch { }
+
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var a = all[i];
+                    if (a == null) continue;
+                    try
+                    {
+                        if (!ContentGetter.IsArtifactGettableInCurrentRun(a.ArtifactName, em)) continue;
+                        if (taken.Contains((int)a.ArtifactName)) continue;
+                        result.Add(a);
+                    }
+                    catch { }
+                }
+                Log($"  候选池: 全部 {all.Count} / 界面已占 {taken.Count} / 可用 {result.Count}");
+            }
+            catch (Exception e) { Log("  构建候选池失败: " + e.Message); }
+            return result;
+        }
+
+        /// <summary>
+        /// 把 3 个小按钮贴到各自对应的星座卡片旁边。
+        ///
+        /// ★ 为什么不能用固定偏移排：游戏这 3 张卡片是自由布局的，屏幕上的视觉顺序与
+        ///   cc.Constellations 的索引顺序不一致 —— 按索引排出来的 "1/2/3" 会对不上号
+        ///   （v3.0 首测实测：点「2」刷新的是看着像「1」的那张）。
+        ///   改成直接跟随卡片位置，位置本身就是对应关系。
+        /// </summary>
+        private void UpdateSingleButtonPositions(ConstellationController cc)
+        {
+            if (_singleButtons.Count == 0 || cc == null) return;
+            var ui = cc.Constellations;
+            if (ui == null) return;
+
+            // 取渲染相机：游戏的 Canvas 是 ScreenSpaceCamera，世界坐标必须经它转换。
+            // 注意 ConstellationController.Canvas 字段其实是 CanvasGroup（不是 Canvas），
+            // 所以从卡片对象往上找真正的 Canvas。
+            Camera cam = null;
+            try
+            {
+                for (int i = 0; i < ui.Count; i++)
+                {
+                    var ci = ui[i];
+                    if (ci == null) continue;
+                    var cv = ci.GetComponentInParent<Canvas>();
+                    if (cv != null) { cam = cv.worldCamera; break; }
+                }
+            }
+            catch { }
+
+            for (int i = 0; i < _singleButtons.Count && i < ui.Count; i++)
+            {
+                var b = _singleButtons[i];
+                var c = ui[i];
+                if (b == null || c == null) continue;
+                try
+                {
+                    Vector3 world = c.transform.position;
+                    Vector3 screen = (cam != null) ? cam.WorldToScreenPoint(world) : world;
+                    if (screen.z < 0f) continue;      // 在相机背后，跳过
+
+                    var rt = b.GetComponent<RectTransform>();
+                    if (rt == null) continue;
+                    // Overlay Canvas 的坐标就是屏幕像素（锚点在左下角）。
+                    // 偏移量按实测界面标定：Constellation 的 transform 落在「连线图与卡片之间」，
+                    // 再往下 370 像素才到卡片底部附近（v3.0.1 首测截图标定）。
+                    rt.anchoredPosition = new Vector2(screen.x, screen.y - 370f);
+                }
+                catch { }
+            }
         }
 
         /// <summary>
@@ -1233,7 +1584,7 @@ namespace DiceVaders.ConstellationTool
             GUI.enabled = inScene;
 
             GUI.color = new Color(0.2f, 0.85f, 0.5f, 1f);
-            if (GUI.Button(new Rect(x, y, W, H), "重掷星座")) DoReroll();
+            if (GUI.Button(new Rect(x, y, W, H), "刷新星座")) DoReroll();
             y += H + 4f;
             GUI.color = new Color(0.4f, 0.6f, 0.9f, 1f);
             if (GUI.Button(new Rect(x, y, W, H), "补详情")) RestoreDetails(cc);
